@@ -46,13 +46,24 @@ module NASASMAPsm_Mod
      logical                :: startMode
      integer                :: nc
      integer                :: nr
+     integer                :: nc_err !HK
+     integer                :: nr_err !HK
+     
      real,     allocatable      :: smobs(:,:)
-     real*8,     allocatable    :: smtime(:,:)
+     real*8,   allocatable      :: smtime(:,:)
+     real,     allocatable      :: smobs_err(:,:) !HK
+     real*8,   allocatable      :: smtime_err(:,:)!HK
+     real*8,   allocatable      :: obsl_err(:)
 
      real                       :: ssdev_inp
+     real                       :: ssdev_2d_inp
      integer, allocatable       :: n11(:)
      real, allocatable          :: rlat(:)
      real, allocatable          :: rlon(:)
+
+     integer, allocatable       :: n11_err(:) !HK
+     real, allocatable          :: rlat_err(:)!HK
+     real, allocatable          :: rlon_err(:)!HK
 
      real,    allocatable       :: model_xrange(:,:,:)
      real,    allocatable       :: obs_xrange(:,:,:)
@@ -63,7 +74,7 @@ module NASASMAPsm_Mod
      real,    allocatable       :: model_sigma(:,:)
      real,    allocatable       :: obs_sigma(:,:)
      character*20           :: data_designation
-     character*3             :: release_number
+     character*3            :: release_number
      integer                :: nbins
      integer                :: ntimes
 
@@ -75,6 +86,20 @@ module NASASMAPsm_Mod
      character*100          :: modelcdffile
      character*100          :: obscdffile
 
+     !HK
+     logical                :: err_switch   ! reading 2d err map one time
+
+     character*20           :: errdata_designation
+     character*100          :: obserrfile   ! 2-d error variance map (L2 format)
+     integer                :: err_read_opt ! 0: use one constant err for obs
+                                            ! 1: use 2d err map for obs
+                                            
+     integer                :: SMAP_QC_opt !HK  
+     integer                :: LSM_vegtqf_opt    ! 0: no mask obs data based on LSM  
+                                                 ! 1: mask obs data based on LSM 
+     integer                :: SMAP_vegtqf_opt   ! 0: no mask obs data based on SMAP  
+                                                 ! 1: mask obs data based on
+                                                 ! SMAP 
   end type NASASMAPsm_dec
   
   type(NASASMAPsm_dec),allocatable :: NASASMAPsm_struc(:)
@@ -118,6 +143,7 @@ contains
 !   \end{description}
 !EOP
     real, parameter        ::  minssdev =0.001
+    real, parameter        ::  maxssdev = 0.11 !HK
     integer                ::  n,i,t,kk,jj
     integer                ::  ftn
     integer                ::  status
@@ -135,12 +161,17 @@ contains
     type(pert_dec_type)    ::  obs_pert
     real, pointer          ::  obs_temp(:,:)
     real                   :: gridDesci(50)
+    real                   :: gridDesci_err(50) !HK
+    real                   :: temp_gridDesci(50) !HK
+
     real, allocatable          :: ssdev(:)
+    real, allocatable          :: ssdev_2d(:) !HK
 
     real, allocatable          ::  obserr(:,:)
     real, allocatable          ::  lobserr(:,:)
     integer                :: c,r
     real, allocatable          :: ssdev_grid(:,:)
+    real, allocatable          :: ssdev_2d_grid(:,:) !HK
     integer                :: ngrid
 
 
@@ -228,6 +259,50 @@ contains
       call LIS_verify(status, "SMAP(NASA) CDF read option: not defined")
    enddo
 
+   !HK
+   do n=1, LIS_rc%nnest
+
+      call ESMF_ConfigFindLabel(LIS_config, "SMAP(NASA) soil moisture apply SMAP QC flags:", rc=status) 
+      call ESMF_ConfigGetAttribute(LIS_config, NASASMAPsm_struc(n)%SMAP_QC_opt, rc=status)
+      call LIS_verify(status, "SMAP(NASA) soil moisture apply SMAP QC flags: not defined")
+
+      call ESMF_ConfigFindLabel(LIS_config, "LSM vegt QF option:", rc=status)    ! 0: use one constant errvar for obs
+      call ESMF_ConfigGetAttribute(LIS_config, NASASMAPsm_struc(n)%LSM_vegtqf_opt, rc=status)
+      call LIS_verify(status, "LSM vget QF option: not defined")
+
+      call ESMF_ConfigFindLabel(LIS_config, "SMAP vegt QF option:", rc=status)    ! 0: use one constant errvar for obs
+      call ESMF_ConfigGetAttribute(LIS_config, NASASMAPsm_struc(n)%SMAP_vegtqf_opt, rc=status)
+      call LIS_verify(status, "SMAP vget QF option: not defined")
+   enddo
+
+   !HK
+   do n=1, LIS_rc%nnest
+      NASASMAPsm_struc(n)%err_switch = .false.   
+
+      call ESMF_ConfigFindLabel(LIS_config, "SMAP(NASA) error read option:", rc=status)    ! 0: use one constant errvar for obs
+      call ESMF_ConfigGetAttribute(LIS_config, NASASMAPsm_struc(n)%err_read_opt, rc=status)
+      call LIS_verify(status, "SMAP(NASA) error read option: not defined")
+   enddo
+
+   !HK
+   call ESMF_ConfigFindLabel(LIS_config,"SMAP(NASA) soil moisture error data designation:",&
+        rc=status)
+   do n=1,LIS_rc%nnest
+      call ESMF_ConfigGetAttribute(LIS_config,&
+           NASASMAPsm_struc(n)%errdata_designation,&
+           rc=status)
+      call LIS_verify(status, 'SMAP(NASA) soil moisture error data designation: is missing')
+   enddo
+
+   !HK
+   call ESMF_ConfigFindLabel(LIS_config,"SMAP(NASA) observation error file:",&
+        rc=status)
+   do n=1,LIS_rc%nnest
+      call ESMF_ConfigGetAttribute(LIS_config,NASASMAPsm_struc(n)%obserrfile,rc=status)   
+      call LIS_verify(status, 'SMAP(NASA) observation error file: not defined')
+   enddo
+
+
    do n=1,LIS_rc%nnest
        call ESMF_AttributeSet(OBS_State(n),"Data Update Status",&
             .false., rc=status)
@@ -243,9 +318,11 @@ contains
        
        call ESMF_AttributeSet(OBS_State(n),"Number Of Observations",&
             LIS_rc%obs_ngrid(k),rc=status)
+
        call LIS_verify(status)
        
     enddo
+    
 
     write(LIS_logunit,*)&
          '[INFO] read SMAP(NASA) soil moisture data specifications'       
@@ -285,15 +362,17 @@ contains
           read(ftn,fmt='(a40)') vname(i)
           read(ftn,*) varmin(i),varmax(i)
           write(LIS_logunit,*) '[INFO] ',vname(i),varmin(i),varmax(i)
+
        enddo
        call LIS_releaseUnitNumber(ftn)  
        
        allocate(ssdev(LIS_rc%obs_ngrid(k)))
+       allocate(ssdev_2d(LIS_rc%obs_ngrid(k))) !HK
        
        if(trim(LIS_rc%perturb_obs(k)).ne."none") then 
           allocate(obs_pert%vname(1))
           allocate(obs_pert%perttype(1))
-          allocate(obs_pert%ssdev(1))
+          allocate(obs_pert%ssdev(1)) 
           allocate(obs_pert%stdmax(1))
           allocate(obs_pert%zeromean(1))
           allocate(obs_pert%tcorr(1))
@@ -303,10 +382,11 @@ contains
 
           call LIS_readPertAttributes(1,LIS_rc%obspertAttribfile(k),&
                obs_pert)
-
+        
 ! Set obs err to be uniform (will be rescaled later for each grid point). 
-          ssdev = obs_pert%ssdev(1)
-          NASASMAPsm_struc(n)%ssdev_inp = obs_pert%ssdev(1)
+          ssdev = obs_pert%ssdev(1) 
+          NASASMAPsm_struc(n)%ssdev_inp = obs_pert%ssdev(1) 
+          !write (LIS_logunit, *) '[HK] Mod: ', NASASMAPsm_struc(n)%ssdev_inp 
 
           pertField(n) = ESMF_FieldCreate(arrayspec=pertArrSpec,&
                grid=LIS_obsensOnGrid(n,k),name="Observation"//vid(1)//vid(2),&
@@ -326,6 +406,7 @@ contains
              call ESMF_AttributeSet(pertField(n),"Standard Deviation",&
                   ssdev,itemCount=LIS_rc%obs_ngrid(k),rc=status)
              call LIS_verify(status)
+
           endif
           
           call ESMF_AttributeSet(pertField(n),"Std Normal Max",&
@@ -373,17 +454,35 @@ contains
           NASASMAPsm_struc(n)%nc = 3856
           NASASMAPsm_struc(n)%nr = 1624
        endif
+    
+       !HK
+       if(NASASMAPsm_struc(n)%errdata_designation.eq."L3") then 
+          NASASMAPsm_struc(n)%nc_err = 964
+          NASASMAPsm_struc(n)%nr_err = 406
+       elseif(NASASMAPsm_struc(n)%errdata_designation.eq."L2") then
+          NASASMAPsm_struc(n)%nc_err = 964
+          NASASMAPsm_struc(n)%nr_err = 406
+       elseif(NASASMAPsm_struc(n)%errdata_designation.eq."L3_E") then 
+          NASASMAPsm_struc(n)%nc_err = 3856
+          NASASMAPsm_struc(n)%nr_err = 1624
+       elseif(NASASMAPsm_struc(n)%errdata_designation.eq."L2_E") then
+          NASASMAPsm_struc(n)%nc_err = 3856
+          NASASMAPsm_struc(n)%nr_err = 1624
+       endif
 
        allocate(NASASMAPsm_struc(n)%smobs(LIS_rc%obs_lnc(k),LIS_rc%obs_lnr(k)))
        allocate(NASASMAPsm_struc(n)%smtime(LIS_rc%obs_lnc(k),LIS_rc%obs_lnr(k)))
-       
+       !HK
+       allocate(NASASMAPsm_struc(n)%smobs_err(LIS_rc%obs_lnc(k),LIS_rc%obs_lnr(k)))
+       allocate(NASASMAPsm_struc(n)%smtime_err(LIS_rc%obs_lnc(k),LIS_rc%obs_lnr(k)))
        NASASMAPsm_struc(n)%smtime = -1
+       NASASMAPsm_struc(n)%smtime_err = -1
       
     enddo
 
     do n=1,LIS_rc%nnest
        allocate(ssdev(LIS_rc%obs_ngrid(k)))
-       ssdev = obs_pert%ssdev(1)
+       ssdev = obs_pert%ssdev(1) 
        
        if(LIS_rc%dascaloption(k).eq."CDF matching") then 
 
@@ -466,7 +565,7 @@ contains
                "SoilMoist",&
                NASASMAPsm_struc(n)%obs_xrange,&
                NASASMAPsm_struc(n)%obs_cdf)      
-          
+           
           if(NASASMAPsm_struc(n)%useSsdevScal.eq.1) then 
              if(NASASMAPsm_struc(n)%ntimes.eq.1) then 
                 jj = 1
@@ -476,26 +575,30 @@ contains
              do t=1,LIS_rc%obs_ngrid(k)
                 if(NASASMAPsm_struc(n)%obs_sigma(t,jj).gt.0) then 
 
-                   print*, ssdev(t), NASASMAPsm_struc(n)%model_sigma(t,jj),&
-                        NASASMAPsm_struc(n)%obs_sigma(t,jj)
-
-
-                   ssdev(t) = ssdev(t)*NASASMAPsm_struc(n)%model_sigma(t,jj)/&
+          !         !print*, ssdev(t), NASASMAPsm_struc(n)%model_sigma(t,jj),&
+          !         !     NASASMAPsm_struc(n)%obs_sigma(t,jj)
+          !       
+                   ssdev(t) = ssdev(t)*NASASMAPsm_struc(n)%model_sigma(t,jj)/& !HK: 
                         NASASMAPsm_struc(n)%obs_sigma(t,jj)
                    !                c = LIS_domain(n)%grid(t)%col
                    !                r = LIS_domain(n)%grid(t)%row
                    !                ssdev_grid(c,r) = ssdev(t) 
                    if(ssdev(t).lt.minssdev) then 
                       ssdev(t) = minssdev
+                    
+                   elseif (ssdev(t).gt.maxssdev) then !HK
+                      !write (LIS_logunit, *) '[HK] ssdev too big: ', ssdev(t)
+                      ssdev(t) = maxssdev
                    endif
                 endif
              enddo
              
-!          open(100,file='ssdev.bin',form='unformatted')
-!          write(100) ssdev_grid
-!          close(100)
-!          stop
+!         ! open(100,file='ssdev.bin',form='unformatted')
+!         ! write(100) ssdev_grid
+!         ! close(100)
+!         ! stop
           endif
+
          endif     
 #if 0           
           allocate(obserr(LIS_rc%obs_gnc(k),LIS_rc%obs_gnr(k)))
@@ -606,6 +709,44 @@ contains
             NASASMAPsm_struc(n)%rlat, &
             NASASMAPsm_struc(n)%rlon, &
             NASASMAPsm_struc(n)%n11)
+       
+       !HK 
+       if(NASASMAPsm_struc(n)%errdata_designation.eq."L3".or.&
+            NASASMAPsm_struc(n)%errdata_designation.eq."L2") then
+          gridDesci_err = 0
+          gridDesci_err(1) = 9
+          gridDesci_err(2) = 964
+          gridDesci_err(3) = 406
+          gridDesci_err(9) = 4 !M36 grid
+          gridDesci_err(20) = 64
+          gridDesci_err(10) = 0.36 
+          gridDesci_err(11) = 1 !for the global switch
+       elseif(NASASMAPsm_struc(n)%errdata_designation.eq."L3_E".or.&
+            NASASMAPsm_struc(n)%errdata_designation.eq."L2_E") then
+          gridDesci_err = 0
+          gridDesci_err(1) = 9
+          gridDesci_err(2) = 3856
+          gridDesci_err(3) = 1624
+          gridDesci_err(9) = 5 !M09 grid
+          gridDesci_err(20) = 64
+          gridDesci_err(10) = 0.09 
+          gridDesci_err(11) = 1 !for the global switch
+       endif
+
+       !HK
+       allocate(NASASMAPsm_struc(n)%n11_err(LIS_rc%obs_lnc(k)*&
+            LIS_rc%obs_lnr(k)))
+       allocate(NASASMAPsm_struc(n)%rlat_err(&
+            LIS_rc%obs_lnc(k)*LIS_rc%obs_lnr(k)))
+       allocate(NASASMAPsm_struc(n)%rlon_err(&
+            LIS_rc%obs_lnc(k)*LIS_rc%obs_lnr(k)))
+       !HK 
+       call neighbor_interp_input_withgrid(gridDesci_err,&
+            LIS_rc%obs_gridDesc(k,:),&
+            LIS_rc%obs_lnc(k)*LIS_rc%obs_lnr(k),&
+            NASASMAPsm_struc(n)%rlat_err, &
+            NASASMAPsm_struc(n)%rlon_err, &
+            NASASMAPsm_struc(n)%n11_err)
 
        if(NASASMAPsm_struc(n)%data_designation.eq."SPL3SMP".or.&
             NASASMAPsm_struc(n)%data_designation.eq."SPL3SMP_E") then
